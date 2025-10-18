@@ -1,109 +1,103 @@
+import feedparser
 import requests
 from bs4 import BeautifulSoup
-from pythainlp import word_tokenize
 import json
 from pathlib import Path
-import time
+import re
 
-# โฟลเดอร์เก็บข้อมูล
-out_dir = Path("thai_ner_project/data")
-out_dir.mkdir(parents=True, exist_ok=True)
-out_file = out_dir / "news.jsonl"
-
-# RSS feed ที่จะดึงข่าว (เพิ่มได้เรื่อย ๆ)
+# ---------- RSS SOURCES ----------
 RSS_FEEDS = [
-    "https://www.thairath.co.th/rss/news"
+    "https://www.thairath.co.th/rss/news",
+    "https://www.thairath.co.th/rss/politic",
+    "https://www.thairath.co.th/rss/economy",
+    "https://www.thairath.co.th/rss/sport",
+    "https://www.matichon.co.th/rss/generalnews",
+    "https://www.khaosod.co.th/rss/entertainment",
+    "https://www.matichon.co.th/rss/news",
+    "https://www.khaosod.co.th/rss/news",
+    "https://www.posttoday.com/rss/news",
+    "https://www.dailynews.co.th/rss/news",
+    "https://www.sanook.com/news/rss/",
+    "https://www.komchadluek.net/news/feed",
+    "https://www.bangkokbiznews.com/rss/news",
+    "https://www.thaipost.net/main/rss",
+    "https://www.innnews.co.th/rss/news",
+    "https://www.ryt9.com/rss/getnews.php?type=1",
+    "https://www.springnews.co.th/rss/news",
+    "https://www.amarintv.com/feed/news",
+    "https://www.tnnthailand.com/rss/news",
+    "https://www.thairath.co.th/rss/foreign",
+    "https://www.thairath.co.th/rss/local",
+    "https://www.khaosod.co.th/rss/foreign",
+    "https://www.khaosod.co.th/rss/crime",
 ]
 
-def fetch_rss_links(feed_url):
-    """ดึงลิงก์ข่าวจาก RSS (รองรับหลายรูปแบบ)"""
-    try:
-        r = requests.get(feed_url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
-        r.raise_for_status()
-        soup = BeautifulSoup(r.content, "xml")
+# ---------- SAVE PATH ----------
+output_file = Path("thai_ner_project/data/news.jsonl")
+output_file.parent.mkdir(parents=True, exist_ok=True)
 
-        links = []
-        for item in soup.find_all("item"):
-            link_tag = item.find("link")
-            if link_tag:
-                # ดึงทั้ง text กับ .string เผื่อรูปแบบต่างกัน
-                link = link_tag.text.strip() if link_tag.text else link_tag.string.strip()
-                links.append(link)
+# ---------- HELPERS ----------
+def clean_html(raw_html: str) -> str:
+    """ล้าง HTML, แท็ก, และช่องว่าง"""
+    if not raw_html:
+        return ""
+    text = re.sub(r"<[^>]+>", " ", raw_html)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
 
-        # fallback ถ้าไม่มี <item>
-        if not links:
-            for link_tag in soup.find_all("link"):
-                href = link_tag.text.strip() if link_tag.text else ""
-                if href.startswith("http"):
-                    links.append(href)
-
-        return list(set(links))  # กันซ้ำ
-    except Exception as e:
-        print(f"[error] ดึง RSS ไม่ได้จาก {feed_url} -> {e}")
-        return []
-
-def fetch_article_text(url):
-    """ดึงหัวข้อข่าว (<h1>) + เนื้อหาข่าว (<p>)"""
+def fetch_full_article(url: str) -> str:
+    """พยายามดึงเนื้อข่าวเต็ม ถ้าทำได้"""
     try:
         r = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
-        r.raise_for_status()
+        if r.status_code != 200:
+            return ""
         soup = BeautifulSoup(r.text, "html.parser")
 
-        # 🔹 หัวข้อข่าว
-        title_tag = soup.find("h1")
-        title = title_tag.get_text(strip=True) if title_tag else ""
+        # พยายามเลือก container หลักของข่าว
+        possible_tags = [
+            "article", "div[itemprop='articleBody']", "div.entry-content",
+            "div.td-post-content", "div.main-content", "section.article"
+        ]
+        for tag in possible_tags:
+            content = soup.select_one(tag)
+            if content:
+                text = clean_html(content.get_text(separator=" "))
+                if len(text) > 200:
+                    return text
+        return ""
+    except Exception:
+        return ""
 
-        # 🔹 รวมเนื้อหาข่าวจากทุกแท็ก <p>
-        paragraphs = soup.find_all("p")
-        content = "\n".join(p.get_text(strip=True) for p in paragraphs)
+# ---------- MAIN ----------
+all_articles = []
+for feed_url in RSS_FEEDS:
+    feed = feedparser.parse(feed_url)
+    for entry in feed.entries[:30]:  # ดึงข่าวละไม่เกิน 10 ชิ้น
+        text = ""
+        # 1️⃣ ลองใช้ description ก่อน
+        if hasattr(entry, "description"):
+            text = clean_html(entry.description)
+        # 2️⃣ ถ้ายังสั้นเกินไป ลองดึงเนื้อข่าวเต็ม
+        if len(text) < 200 and hasattr(entry, "link"):
+            full_text = fetch_full_article(entry.link)
+            if len(full_text) > 200:
+                text = full_text
 
-        # 🔹 รวมทั้งหมดเป็นข้อความเดียว (หัวข้อ + เนื้อหา)
-        full_text = (title + "\n" + content).strip()
+        # ข้ามข่าวที่ไม่มีเนื้อหา
+        if not text or len(text.split()) < 10:
+            continue
 
-        # 🔹 กรองข่าวที่ไม่มีเนื้อหา
-        if len(content) < 50:
-            print(f"[skip] เนื้อหาสั้นเกินไป {url}")
-            return None
+        record = {
+            "source": feed_url,
+            "data": {"text": entry.title + "\n" + text},
+            "meta": {"url": entry.link},
+        }
+        all_articles.append(record)
+        print(f"✅ ดึงข่าวจาก {feed_url.split('//')[1].split('/')[0]} : {entry.title[:50]}...")
 
-        return full_text
+# ---------- SAVE ----------
+with open(output_file, "w", encoding="utf-8") as f:
+    for r in all_articles:
+        f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
-    except Exception as e:
-        print(f"[skip] {url} → {e}")
-        return None
-
-    finally:
-        print(f"[done] โหลดเสร็จ: {url}")
-
-def main():
-    all_news = []
-    for feed in RSS_FEEDS:
-        print(f"กำลังดึงจาก: {feed}")
-        links = fetch_rss_links(feed)
-        print(f"  เจอลิงก์ {len(links)} ข่าว")
-
-        for url in links[:5]:  # จำกัดข่าวละ 5 ชิ้น (ลองก่อน)
-            text = fetch_article_text(url)
-            if not text:
-                continue
-
-            # ตัดคำ
-            tokens = word_tokenize(text, engine="newmm")
-
-            # เก็บเป็น JSONL (พร้อมสำหรับ Label Studio)
-            record = {
-                "data": {"text": text, "tokens": tokens},
-                "meta": {"url": url}
-            }
-            all_news.append(record)
-            print(f"  ✅ เก็บข่าวจาก {url}")
-            time.sleep(1)  # หน่วงเวลานิดกันโดน block
-
-    # เขียนไฟล์ออกมา
-    with open(out_file, "w", encoding="utf-8") as f:
-        for news in all_news:
-            f.write(json.dumps(news, ensure_ascii=False) + "\n")
-
-    print(f"\nบันทึกข่าวทั้งหมด {len(all_news)} ชิ้น -> {out_file}")
-
-if __name__ == "__main__":
-    main()
+print(f"\n📰 เก็บข่าวสำเร็จทั้งหมด {len(all_articles)} ข่าว -> {output_file}")
